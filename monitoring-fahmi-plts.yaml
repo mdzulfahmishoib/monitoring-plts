@@ -1,0 +1,815 @@
+# ============================================================
+#   ESPHome - Monitor PLTS Fahmi
+#   Hardware : ESP8266 (NodeMCU/Wemos D1 Mini direkomendasikan)
+#   Sensor   : PZEM-017 via RS485/MAX485
+#   Display  : LCD 16x2 I2C (PCF8574, alamat 0x27)
+#   Relay    : 2x relay (Maju/Mundur) untuk Solar Tracker
+#   Board    : Wemos D1 Mini
+# ============================================================
+
+esphome:
+  name: monitoring-fahmi-plts
+  friendly_name: Monitoring Fahmi PLTS
+  on_boot:
+    priority: 600
+    then:
+      - lambda: |-
+          id(lcd_display).backlight();
+          id(menu_page) = 99;
+      - delay: 3s
+      - lambda: |-
+          id(menu_page) = 0;
+          id(lcd_display).clear();
+
+# ============================================================
+#  PREFERENCES (Optimasi Penulisan Flash)
+# ============================================================
+preferences:
+  flash_write_interval: 1h # Menulis ke flash maksimal 1 jam sekali
+
+esp8266:
+  board: d1_mini
+  # CATATAN: esp01_1m hanya punya GPIO0, GPIO1(TX), GPIO2, GPIO3(RX)
+  # Untuk proyek ini sangat disarankan ganti ke d1_mini atau nodemcuv2
+  # agar mendapatkan lebih banyak pin (D0-D8, I2C, dll)
+
+# ============================================================
+#  LOGGING
+# ============================================================
+logger:
+  level: NONE
+  # Nonaktifkan logger via hardware serial agar tidak bentrok
+  # dengan UART yang dipakai PZEM/RS485
+  baud_rate: 0
+
+# ============================================================
+#  SAFE MODE — Jika crash lebih dari 10x, masuk mode aman
+#  sehingga bisa di-OTA ulang tanpa harus colok USB
+# ============================================================
+safe_mode:
+  num_attempts: 10
+  reboot_timeout: 3min
+
+# ============================================================
+#  HOME ASSISTANT API
+# ============================================================
+api:
+  encryption:
+    key: "JPKtV/Z2jJzx0BLaGAZCFQQPxbni2aDsTPmOsIQoPvs="
+  services:
+
+
+    # Service 2: Reset Memori PZEM (Hardware)
+    - service: reset_memori_pzem_saja
+      then:
+        - script.execute: script_reset_pzem
+
+    # Service untuk kontrol motor tracker dari HA
+    - service: motor_maju_manual
+      then:
+        - switch.turn_on: relay_maju
+        - switch.turn_off: relay_mundur
+
+    - service: motor_mundur_manual
+      then:
+        - switch.turn_on: relay_mundur
+        - switch.turn_off: relay_maju
+
+    - service: motor_stop
+      then:
+        - switch.turn_off: relay_maju
+        - switch.turn_off: relay_mundur
+
+# ============================================================
+#  OTA
+# ============================================================
+ota:
+  - platform: esphome
+    password: "2079e9d323965bf2f26a2ef16c07d547"
+
+# ============================================================
+#  WIFI
+# ============================================================
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "Monitoring-Fahmi-Plts"
+    password: "12345678"
+
+captive_portal:
+
+# ============================================================
+#  NTP / WAKTU (Pengganti configTime, timezone WIB = UTC+7)
+# ============================================================
+time:
+  - platform: sntp
+    id: waktu_sntp
+    timezone: "Asia/Jakarta"
+    servers:
+      - us.pool.ntp.org
+      - pool.ntp.org
+    on_time:
+      # ---- Reset data harian jam 23:59:50 ----
+      - seconds: 50
+        minutes: 59
+        hours: 23
+        then:
+          - lambda: |-
+              // Geser histori (Gunakan sensor template sebagai sumber)
+              id(kwh_4hari) = id(kwh_3hari);
+              id(kwh_3hari) = id(kwh_2hari);
+              id(kwh_2hari) = id(kwh_kemarin);
+              id(kwh_kemarin) = id(pzem_energy_today).state;
+
+              id(watt_max) = 0.0;
+              id(sun_hour) = 0.0;
+          - logger.log: "RESET DATA HARIAN BERHASIL"
+
+      # ---- Matikan LCD & nolkan watt jam 18:00 ----
+      - seconds: 0
+        minutes: 0
+        hours: 18
+        then:
+          - globals.set:
+              id: menolkan_watt
+              value: 'true'
+          - globals.set:
+              id: lcd_aktif
+              value: 'false'
+          # Paksa update sensor agar langsung menjadi 0.0 di HA via lambda
+          - lambda: |-
+              id(pzem_current).publish_state(0.0);
+              id(pzem_power).publish_state(0.0);
+
+      # ---- Aktifkan LCD & watt jam 05:15 ----
+      - seconds: 0
+        minutes: 15
+        hours: 5
+        then:
+          - globals.set:
+              id: menolkan_watt
+              value: 'false'
+          - globals.set:
+              id: lcd_aktif
+              value: 'true'
+
+      # ---- Tracker: Balik ke Timur jam 17:50 ----
+      - seconds: 0
+        minutes: 50
+        hours: 17
+        then:
+          - if:
+              condition:
+                lambda: 'return !id(sudah_balik);'
+              then:
+                - logger.log: "Balik ke Timur - 90 detik"
+                - switch.turn_off: relay_maju
+                - switch.turn_on: relay_mundur
+                - delay: 90s
+                - switch.turn_off: relay_mundur
+                - globals.set:
+                    id: sudah_balik
+                    value: 'true'
+
+      # ---- Tracker: Reset flag balik setiap jam 09:00 ----
+      - seconds: 0
+        minutes: 0
+        hours: 9
+        then:
+          - globals.set:
+              id: sudah_balik
+              value: 'false'
+          - logger.log: "Flag tracker di-reset"
+
+      # ---- Tracker: Gerak 0.86 detik setiap (280 detik) ----
+      #      Aktif antara 10:00 - 15:00
+      #      ESPHome tidak bisa modulo waktu secara native,
+      #      jadi kita jadwalkan setiap interval eksplisit.
+      #      Gunakan interval component di bawah sebagai gantinya.
+
+# ============================================================
+#  I2C BUS (untuk LCD)
+#  Pin default I2C ESP8266:
+#    SDA = GPIO4 (D2 pada NodeMCU)
+#    SCL = GPIO5 (D1 pada NodeMCU)
+#  Pada esp01: GPIO0=SDA, GPIO2=SCL (terbatas!)
+# ============================================================
+i2c:
+  sda: GPIO4
+  scl: GPIO5
+  scan: true
+  id: bus_i2c
+
+# ============================================================
+#  UART untuk RS485 / PZEM-017
+#  Menggunakan Pin HW UART Standar (TX/RX Wemos):
+#    MAX485_RO  = RX (GPIO3) → rx_pin ESP 
+#    MAX485_RE & DE digabung ke D5 (GPIO14) → flow_control
+#    MAX485_DI  = TX (GPIO1) → tx_pin ESP
+#  ⚠ PENTING: Cabut kabel di pin TX/RX saat flash via USB!
+# ============================================================
+uart:
+  id: uart_pzem
+  tx_pin: GPIO1     # Pin TX Wemos
+  rx_pin: GPIO3     # Pin RX Wemos
+  baud_rate: 9600
+  stop_bits: 2      # Menggunakan stop bits 2 sesuai standar PZEM-017
+  parity: NONE
+  data_bits: 8
+  debug:
+    direction: BOTH
+    sequence:
+      - lambda: UARTDebug::log_hex(direction, bytes, ' ');
+
+# ============================================================
+#  MODBUS untuk PZEM-017
+# ============================================================
+modbus:
+  id: modbus_pzem
+  uart_id: uart_pzem
+  flow_control_pin: GPIO14   # D5 = Gabungan RE + DE
+  send_wait_time: 200ms
+
+# ============================================================
+#  SCRIPTS (Logika terpusat untuk Reset)
+# ============================================================
+script:
+  - id: script_reset_pzem
+    then:
+      - pzemdc.reset_energy: pzem_hub
+      - logger.log: "Memori PZEM-017 direset"
+
+  - id: script_tracker_maju_5menit
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: 'return !id(motor_aktif);'
+          then:
+            - globals.set: {id: mode_auto, value: 'true'}
+            - switch.turn_off: relay_mundur
+            - switch.turn_on: relay_maju
+            - delay: 5min
+            - switch.turn_off: relay_maju
+            - globals.set: {id: mode_auto, value: 'false'}
+            - switch.turn_off: sw_tracker_maju_5menit
+          else:
+            - switch.turn_off: sw_tracker_maju_5menit
+
+  - id: script_tracker_mundur_5menit
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: 'return !id(motor_aktif);'
+          then:
+            - globals.set: {id: mode_auto, value: 'true'}
+            - switch.turn_off: relay_maju
+            - switch.turn_on: relay_mundur
+            - delay: 5min
+            - switch.turn_off: relay_mundur
+            - globals.set: {id: mode_auto, value: 'false'}
+            - switch.turn_off: sw_tracker_mundur_5menit
+          else:
+            - switch.turn_off: sw_tracker_mundur_5menit
+
+  - id: script_tracker_mendatar
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: 'return !id(motor_aktif);'
+          then:
+            - globals.set: {id: mode_auto, value: 'true'}
+            - globals.set: {id: sequence_mundur, value: 'true'}
+            - switch.turn_off: relay_mundur
+            - switch.turn_on: relay_maju
+            - delay: 5min
+            - switch.turn_off: relay_maju
+            - switch.turn_on: relay_mundur
+            - delay: 30s
+            - switch.turn_off: relay_mundur
+            - globals.set: {id: mode_auto, value: 'false'}
+            - globals.set: {id: sequence_mundur, value: 'false'}
+            - switch.turn_off: sw_tracker_mendatar
+          else:
+            - switch.turn_off: sw_tracker_mendatar
+
+# ============================================================
+#  GLOBALS (Variabel persisten selama runtime)
+# ============================================================
+globals:
+  - id: kwh_kemarin
+    type: float
+    restore_value: true
+    initial_value: '0.0'
+
+  - id: kwh_2hari
+    type: float
+    restore_value: true
+    initial_value: '0.0'
+
+  - id: kwh_3hari
+    type: float
+    restore_value: true
+    initial_value: '0.0'
+
+  - id: kwh_4hari
+    type: float
+    restore_value: true
+    initial_value: '0.0'
+
+  - id: watt_max
+    type: float
+    restore_value: false
+    initial_value: '0.0'
+
+  - id: sun_hour
+    type: float
+    restore_value: false
+    initial_value: '0.0'
+
+  - id: menolkan_watt
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+  - id: lcd_aktif
+    type: bool
+    restore_value: false
+    initial_value: 'true'
+
+  - id: sudah_balik
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+  - id: motor_aktif
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+  - id: mode_auto
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+  - id: sequence_mundur
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+  - id: last_trigger_detik
+    type: int
+    restore_value: false
+    initial_value: '-1'
+
+  # Halaman menu LCD aktif (0–4)
+  - id: menu_page
+    type: int
+    restore_value: false
+    initial_value: '0'
+
+# ============================================================
+#  SENSOR PZEM-017 (Modbus Input Registers)
+#  Register map PZEM-017:
+#    0x0000 = Voltage  (x0.01 V)
+#    0x0001 = Current  (x0.01 A)
+#    0x0002-0x0003 = Power (x0.1 W, 32-bit)
+#    0x0004-0x0005 = Energy (Wh, 32-bit)
+# ============================================================
+sensor:
+  # --- SENSOR PZEM-017 (Hardware Platform) ---
+  - platform: pzemdc
+    id: pzem_hub
+    modbus_id: modbus_pzem
+    address: 1
+    update_interval: 5s
+    voltage:
+      name: "PLTS Tegangan"
+      id: pzem_voltage
+      icon: mdi:lightning-bolt
+      accuracy_decimals: 2
+      filters:
+        - delta: 0.1 # Hanya kirim ke HA jika berubah > 0.1V
+    current:
+      name: "PLTS Arus"
+      id: pzem_current
+      icon: mdi:current-dc
+      accuracy_decimals: 2
+      filters:
+        - lambda: |-
+            return id(menolkan_watt) ? 0.0 : x;
+        - or:
+            - throttle: 60s
+            - delta: 0.01
+    energy:
+      name: "PLTS Total Energi PZEM"
+      id: pzem_energy_total
+      icon: mdi:database-import
+      unit_of_measurement: "kWh"
+      accuracy_decimals: 3
+      device_class: energy
+      state_class: total_increasing
+      # Tanpa multiplier karena data register terbaca sebagai kWh
+
+  # --- SoC Baterai (State of Charge dari Tegangan PZEM) ---
+  - platform: template
+    id: pzem_soc
+    name: "PLTS SoC Baterai"
+    icon: mdi:battery
+    unit_of_measurement: "%"
+    accuracy_decimals: 1
+    update_interval: 5s
+    lambda: |-
+      float v = id(pzem_voltage).state;
+      if (isnan(v) || v < 1.0) return {}; 
+      float soc = (v - 21.0) / (29.4 - 21.0) * 100.0;
+      if (soc < 0.0) soc = 0.0;
+      if (soc > 100.0) soc = 100.0;
+      return soc;
+
+  # --- Daya (Power) — dihitung: V x A ---
+  - platform: template
+    id: pzem_power
+    name: "PLTS Daya"
+    icon: mdi:solar-power
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: 2s
+    lambda: |-
+      if (id(menolkan_watt)) return 0.0;
+      float v = id(pzem_voltage).state;
+      float a = id(pzem_current).state;
+      if (isnan(v) || isnan(a)) return 0.0;
+      float p = v * a;
+      // Update watt max
+      if (p > id(watt_max)) {
+        id(watt_max) = p;
+      }
+      return p;
+    filters:
+      - or:
+          - throttle: 60s # Pastikan sinkron ke HA minimal tiap 60 detik
+          - delta: 0.2    # Lebih sensitif agar perubahan kecil (0.5W) terdeteksi
+          - delta: 5.0    # Respon cepat jika ada perubahan besar
+
+  # --- kWh Hari Ini (Komponen Bawaan ESPHome) ---
+  - platform: total_daily_energy
+    id: pzem_energy_today
+    name: "PLTS Energi Hari Ini"
+    icon: mdi:solar-panel
+    power_id: pzem_power
+    restore: true
+    unit_of_measurement: "kWh"
+    accuracy_decimals: 3
+    device_class: energy
+    state_class: total_increasing
+    filters:
+      # Mengubah Wh menjadi kWh (dibagi 1000)
+      - multiply: 0.001
+
+  # --- Peak Sun Hour ---
+  - platform: template
+    id: peak_sun_hour
+    name: "PLTS Peak Sun Hour"
+    icon: mdi:weather-sunny
+    unit_of_measurement: "jam"
+    state_class: measurement
+    accuracy_decimals: 2
+    update_interval: 10s
+    lambda: |-
+      // PSH = kWh / kapasitas panel (500 Wp = 0.5 kW)
+      id(sun_hour) = id(pzem_energy_today).state / 0.5;
+      return id(sun_hour);
+
+  # --- Daya Maksimum Hari Ini ---
+  - platform: template
+    id: watt_maximum
+    name: "PLTS Daya Maksimum"
+    icon: mdi:lightning-bolt-circle
+    unit_of_measurement: "W"
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 10s
+    lambda: return id(watt_max);
+
+  # --- Histori kWh Kemarin ---
+  - platform: template
+    id: sensor_kwh_kemarin
+    name: "PLTS kWh Kemarin"
+    unit_of_measurement: "kWh"
+    device_class: energy
+    state_class: total
+    accuracy_decimals: 3
+    update_interval: 60s
+    lambda: return id(kwh_kemarin);
+
+  - platform: template
+    id: sensor_kwh_2hari
+    name: "PLTS kWh 2 Hari Lalu"
+    unit_of_measurement: "kWh"
+    device_class: energy
+    state_class: total
+    accuracy_decimals: 3
+    update_interval: 60s
+    lambda: return id(kwh_2hari);
+
+  - platform: template
+    id: sensor_kwh_3hari
+    name: "PLTS kWh 3 Hari Lalu"
+    unit_of_measurement: "kWh"
+    device_class: energy
+    state_class: total
+    accuracy_decimals: 3
+    update_interval: 60s
+    lambda: return id(kwh_3hari);
+
+  - platform: template
+    id: sensor_kwh_4hari
+    name: "PLTS kWh 4 Hari Lalu"
+    unit_of_measurement: "kWh"
+    device_class: energy
+    state_class: total
+    accuracy_decimals: 3
+    update_interval: 60s
+    lambda: return id(kwh_4hari);
+
+  # --- WiFi Signal Strength ---
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    update_interval: 60s
+
+# ============================================================
+#  TEXT SENSOR
+# ============================================================
+text_sensor:
+  - platform: template
+    id: tracker_status_text
+    name: "PLTS Tracker Status"
+    update_interval: 1s
+    lambda: |-
+      if (id(relay_maju).state)   return std::string("Maju");
+      if (id(relay_mundur).state) return std::string("Mundur");
+      return std::string("Standby");
+
+  - platform: wifi_info
+    ip_address:
+      name: "IP Address"
+
+# ============================================================
+#  SWITCH (Relay Kontrol Motor Solar Tracker)
+#  Konfigurasi PIN AMAN (Bebas dari gangguan boot):
+#  relay1 (Maju)   = D0 / GPIO16  (Sangat Aman ✅)
+#  relay2 (Mundur) = D6 / GPIO12  (Sangat Aman ✅)
+#  LED Indikator   = D4 / GPIO2   (built-in LED)
+# ============================================================
+switch:
+  - platform: gpio
+    id: relay_maju
+    name: "Relay Maju"
+    internal: true
+    icon: mdi:arrow-right-bold
+    pin:
+      number: GPIO16    # D0 = relay1
+      mode: OUTPUT
+    restore_mode: ALWAYS_OFF
+    interlock: [relay_mundur]   # Interlock: tidak bisa aktif bersamaan
+    interlock_wait_time: 200ms
+    on_turn_on:
+      - globals.set:
+          id: motor_aktif
+          value: 'true'
+    on_turn_off:
+      - lambda: |-
+          if (!id(relay_mundur).state) {
+            id(motor_aktif) = false;
+            id(mode_auto) = false;
+          }
+
+  - platform: gpio
+    id: relay_mundur
+    name: "Relay Mundur"
+    internal: true
+    icon: mdi:arrow-left-bold
+    pin:
+      number: GPIO12    # D6 = relay2
+      mode: OUTPUT
+    restore_mode: ALWAYS_OFF
+    interlock: [relay_maju]
+    interlock_wait_time: 200ms
+    on_turn_on:
+      - globals.set:
+          id: motor_aktif
+          value: 'true'
+    on_turn_off:
+      - lambda: |-
+          if (!id(relay_maju).state) {
+            id(motor_aktif) = false;
+            id(mode_auto) = false;
+          }
+
+  - platform: template
+    name: "Tracker Maju"
+    id: sw_tracker_maju
+    icon: mdi:arrow-right-bold
+    lambda: |-
+      return id(relay_maju).state;
+    turn_on_action:
+      - switch.turn_on: relay_maju
+    turn_off_action:
+      - switch.turn_off: relay_maju
+
+  - platform: template
+    name: "Tracker Mundur"
+    id: sw_tracker_mundur
+    icon: mdi:arrow-left-bold
+    lambda: |-
+      return id(relay_mundur).state;
+    turn_on_action:
+      - switch.turn_on: relay_mundur
+    turn_off_action:
+      - switch.turn_off: relay_mundur
+
+  - platform: template
+    name: "Tracker Maju 5 Menit"
+    id: sw_tracker_maju_5menit
+    icon: mdi:arrow-right-bold-box
+    optimistic: true
+    turn_on_action:
+      - script.execute: script_tracker_maju_5menit
+    turn_off_action:
+      - script.stop: script_tracker_maju_5menit
+      - switch.turn_off: relay_maju
+      - globals.set: {id: mode_auto, value: 'false'}
+
+  - platform: template
+    name: "Tracker Mundur 5 Menit"
+    id: sw_tracker_mundur_5menit
+    icon: mdi:arrow-left-bold-box
+    optimistic: true
+    turn_on_action:
+      - script.execute: script_tracker_mundur_5menit
+    turn_off_action:
+      - script.stop: script_tracker_mundur_5menit
+      - switch.turn_off: relay_mundur
+      - globals.set: {id: mode_auto, value: 'false'}
+
+  - platform: template
+    name: "Posisikan PLTS Mendatar"
+    id: sw_tracker_mendatar
+    icon: mdi:swap-horizontal-bold
+    optimistic: true
+    turn_on_action:
+      - script.execute: script_tracker_mendatar
+    turn_off_action:
+      - script.stop: script_tracker_mendatar
+      - switch.turn_off: relay_maju
+      - switch.turn_off: relay_mundur
+      - globals.set: {id: mode_auto, value: 'false'}
+      - globals.set: {id: sequence_mundur, value: 'false'}
+
+# ============================================================
+#  BUTTON (Tombol aksi dari HA dashboard)
+# ============================================================
+button:
+  # Tombol 1: Reset Memori PZEM (Hardware)
+  - platform: template
+    id: btn_reset_pzem
+    name: "Reset Memori PZEM"
+    icon: mdi:memory
+    on_press:
+      - script.execute: script_reset_pzem
+
+# ============================================================
+#  INTERVAL (Tracker Otomatis setiap 280 detik)
+# ============================================================
+# ============================================================
+#  INTERVAL (Digabungkan menjadi satu blok)
+# ============================================================
+interval:
+  # 1. Tracker Otomatis setiap 280 detik (Baris 705)
+  - interval: 280s
+    then:
+      - if:
+          condition:
+            lambda: |-
+              auto t = id(waktu_sntp).now();
+              if (!t.is_valid()) return false;
+              int h = t.hour;
+              // Aktif antara 10:00 - 15:00 & motor tidak sibuk
+              return (h >= 10 && h < 15) && !id(motor_aktif);
+          then:
+            - globals.set:
+                id: mode_auto
+                value: 'true'
+            - switch.turn_off: relay_mundur
+            - switch.turn_on: relay_maju
+            - delay: 860ms
+            - switch.turn_off: relay_maju
+            - globals.set:
+                id: mode_auto
+                value: 'false'
+            - logger.log: "Tracker: Gerak Otomatis 0.86 detik"
+
+  # 2. Rotasi Halaman LCD Setiap 5 detik
+  #    (lcd_pcf8574 tidak punya pages — cukup increment menu_page,
+  #     display lambda di bawah akan merender otomatis setiap 1s)
+  - interval: 5s
+    id: rotasi_lcd
+    then:
+      - lambda: |-
+          id(menu_page) = (id(menu_page) + 1) % 6;
+
+# ============================================================
+#  LED INDIKATOR
+#  GPIO2 = D4 = Built-in LED ESP8266 (aktif LOW)
+# ============================================================
+status_led:
+  pin:
+    number: GPIO2
+    inverted: true
+
+# ============================================================
+#  LCD 16x2 I2C
+#  Komponen: lcd_pcf8574
+#  Rotasi halaman tampil setiap 5 detik
+# ============================================================
+# ============================================================
+#  LCD 16x2 I2C
+# ============================================================
+display:
+  - platform: lcd_pcf8574
+    id: lcd_display
+    dimensions: 16x2
+    address: 0x27
+    update_interval: 1s
+    # LCD Karakter menggunakan lambda tunggal, bukan blok 'pages'
+    lambda: |-
+      if (!id(lcd_aktif)) { 
+        it.no_backlight(); 
+        return; 
+      }
+      it.backlight();
+      
+      int page = id(menu_page);
+      char buf[17];
+
+      switch (page) {
+        case 0: // Halaman Sensor Utama
+          // Row 0: col 0 = Tegangan, col 8 = Arus
+          it.printf(0, 0, "%.2fV  ", id(pzem_voltage).state);
+          it.printf(8, 0, "%.2fA  ", id(pzem_current).state);
+          // Row 1: col 0 = Daya, col 8 = Energi
+          it.printf(0, 1, "%.1fW  ", id(pzem_power).state);
+          it.printf(8, 1, "%.3fkWh", id(pzem_energy_today).state);
+          break;
+
+        case 1: // Halaman Wp Max & PSH
+          // Row 0: col 0 = "Wp Max: ", col 8 = " Psh:"
+          it.print(0, 0, "Wp Max: ");
+          it.print(8, 0, " Psh:");
+          // Row 1: col 0 = Watt max, col 9 = Sun Hour
+          it.printf(0, 1, "%.2fW ", id(watt_max));
+          it.printf(9, 1, "%.2fJ ", id(sun_hour));
+          break;
+
+        case 2: // Halaman Histori
+          snprintf(buf, sizeof(buf), "D1:%.2f D2:%.2f", id(kwh_kemarin), id(kwh_2hari));
+          it.print(0, 0, buf);
+          snprintf(buf, sizeof(buf), "D3:%.2f D4:%.2f", id(kwh_3hari), id(kwh_4hari));
+          it.print(0, 1, buf);
+          break;
+
+        case 3: // Halaman Hardware (Total kWh)
+          it.print(0, 0, "Total Energi:");
+          it.printf(0, 1, "%.3f kWh", id(pzem_energy_total).state);
+          break;
+
+        case 4: // Halaman Relay/Tracker
+          it.printf(0, 0, "Relay:%s", id(motor_aktif) ? "Aktif  " : "Mati   ");
+          it.printf(0, 1, "Tracker:%-7s", id(tracker_status_text).state.c_str());
+          break;
+
+        case 5: // Halaman Jam
+          {
+            it.print(1, 0, "Waktu Sekarang");
+            auto t = id(waktu_sntp).now();
+            if (t.is_valid()) {
+              it.strftime(4, 1, "%H:%M:%S", t);
+            } else {
+              it.print(4, 1, "--:--:--");
+            }
+          }
+          break;
+
+        case 99: // Splash Screen
+          it.print(1, 0, "WATTMETER PLTS");
+          it.print(3, 1, "FAHMI PLTS");
+          break;
+      }
+
+
