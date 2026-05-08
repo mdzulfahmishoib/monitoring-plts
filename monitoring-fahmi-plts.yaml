@@ -25,7 +25,7 @@ esphome:
 #  PREFERENCES (Optimasi Penulisan Flash)
 # ============================================================
 preferences:
-  flash_write_interval: 1h # Menulis ke flash maksimal 1 jam sekali
+  flash_write_interval: 30min
 
 esp8266:
   board: d1_mini
@@ -116,15 +116,19 @@ time:
         hours: 23
         then:
           - lambda: |-
-              // Geser histori (Gunakan sensor template sebagai sumber)
-              id(kwh_4hari) = id(kwh_3hari);
-              id(kwh_3hari) = id(kwh_2hari);
-              id(kwh_2hari) = id(kwh_kemarin);
-              id(kwh_kemarin) = id(pzem_energy_today).state;
+              // Validasi agar tidak menyimpan nilai error (NaN)
+              if (!isnan(id(pzem_energy_today).state)) {
+                // Geser histori (Gunakan sensor template sebagai sumber)
+                id(kwh_4hari) = id(kwh_3hari);
+                id(kwh_3hari) = id(kwh_2hari);
+                id(kwh_2hari) = id(kwh_kemarin);
+                id(kwh_kemarin) = id(pzem_energy_today).state;
+              }
 
               id(watt_max) = 0.0;
               id(sun_hour) = 0.0;
-          - logger.log: "RESET DATA HARIAN BERHASIL"
+          - lambda: 'global_preferences->sync();' # Memaksa simpan ke flash secara manual
+          - logger.log: "RESET DATA HARIAN BERHASIL & TERSIMPAN KE FLASH"
 
       # ---- Matikan LCD & nolkan watt jam 18:00 ----
       - seconds: 0
@@ -182,8 +186,16 @@ time:
               value: 'false'
           - logger.log: "Flag tracker di-reset"
 
-      # ---- Tracker: Gerak 0.86 detik setiap (280 detik) ----
-      #      Aktif antara 10:00 - 15:00
+      # ---- Auto Restart jam 03:00 Pagi ----
+      - seconds: 0
+        minutes: 0
+        hours: 3
+        then:
+          - logger.log: "Melakukan Restart Terjadwal (03:00)"
+          - button.press: btn_restart_esp
+
+      # ---- Tracker: Gerak 1.2 detik setiap (330 detik) ----
+      #      Aktif antara 10:00 - 16:00
       #      ESPHome tidak bisa modulo waktu secara native,
       #      jadi kita jadwalkan setiap interval eksplisit.
       #      Gunakan interval component di bawah sebagai gantinya.
@@ -684,15 +696,21 @@ button:
     on_press:
       - script.execute: script_reset_pzem
 
+  # Tombol 2: Restart Perangkat secara Aman
+  - platform: restart
+    id: btn_restart_esp
+    name: "Restart ESP"
+    icon: mdi:restart
+
 # ============================================================
-#  INTERVAL (Tracker Otomatis setiap 280 detik)
+#  INTERVAL (Tracker Otomatis setiap 330 detik)
 # ============================================================
 # ============================================================
 #  INTERVAL (Digabungkan menjadi satu blok)
 # ============================================================
 interval:
-  # 1. Tracker Otomatis setiap 280 detik (Baris 705)
-  - interval: 280s
+  # 1. Tracker Otomatis setiap 330 detik (Baris 705)
+  - interval: 330s
     then:
       - if:
           condition:
@@ -700,20 +718,20 @@ interval:
               auto t = id(waktu_sntp).now();
               if (!t.is_valid()) return false;
               int h = t.hour;
-              // Aktif antara 10:00 - 15:00 & motor tidak sibuk
-              return (h >= 10 && h < 15) && !id(motor_aktif);
+              // Aktif antara 10:00 - 16:00 & motor tidak sibuk
+              return (h >= 10 && h < 16) && !id(motor_aktif);
           then:
             - globals.set:
                 id: mode_auto
                 value: 'true'
             - switch.turn_off: relay_mundur
             - switch.turn_on: relay_maju
-            - delay: 860ms
+            - delay: 1200ms
             - switch.turn_off: relay_maju
             - globals.set:
                 id: mode_auto
                 value: 'false'
-            - logger.log: "Tracker: Gerak Otomatis 0.86 detik"
+            - logger.log: "Tracker: Gerak Otomatis 1.2 detik"
 
   # 2. Rotasi Halaman LCD Setiap 5 detik
   #    (lcd_pcf8574 tidak punya pages — cukup increment menu_page,
